@@ -106,12 +106,12 @@ func main() { // 下载邮件
 		return
 	}
 	if "" == envSV {
-		envSV = "pop.163.com:995:1"
+		envSV = "pop.ym.163.com:995:1"
 	}
 	aEml := strings.Split(envSV, ":")
 	bTLS := false
 	if "" == aEml[0] || "" == aEml[1] || "" == aEml[2] {
-		envSV = "pop.163.com:995:1"
+		envSV = "pop.ym.163.com:995:1"
 		aEml = strings.Split(envSV, ":")
 	}
 	if "1" == aEml[2] {
