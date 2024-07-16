@@ -1,37 +1,34 @@
 package main
 
 import (
-	"bufio"
-	"crypto/md5"
-	"encoding/base64"
-	"encoding/hex"
+	"bytes"
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
+	"mime"
+	"net/mail"
 	"os"
-	"regexp"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/emersion/go-message"
+	msg "github.com/emersion/go-message"
+	eml "github.com/emersion/go-message/mail"
+	_ "github.com/emersion/go-message/charset"
 	"github.com/knadh/go-pop3"
-	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
-// WDir: 工作目录: eml保存目录
 var (
-	VerStr  string = "2023-07-07.11"
-	WDir    string = "./emails/"
-	LogPATH string = "00_bakEmail.md"
-	LogStr  string = ""
-	NowMode string = "list"
-	NID     int    = 1
+	VerStr  string = "2024-07-12.17"
+	XmlPATH string = "00_Emails.xml"
 )
 
-// NowMode: list, downAll, downOne, deleteOne
 
 func main() { // 下载邮件
+
 	// 命令行参数
 	flag.Usage = func() {
 		fmt.Println("# Version:", VerStr)
@@ -41,16 +38,15 @@ func main() { // 下载邮件
 		fmt.Println("  [set|export] eSvrPOP=pop.163.com:995:1")
 		fmt.Println("  [set|export] eUP=xx@163.com:hello")
 		fmt.Println("  ", os.Args[0], "-l 9                 列出最近9封邮件标题")
-		fmt.Println("  ", os.Args[0], "-d 1                 下载序列号为1的邮件并释放附件")
-		fmt.Println("  ", os.Args[0], "-e xx.eml            释放xx.eml中的附件")
+		fmt.Println("  ", os.Args[0], "[-b] [-a] -d 1       下载序列号为1的邮件并释放[正文][附件]")
 		fmt.Println("  ", os.Args[0], "-rm 1                删除序列号为1的邮件")
-		fmt.Println("  ", os.Args[0], "[-sub] -da 9         下载最近9封邮件")
+		fmt.Println("  ", os.Args[0], "-da 9                倒序下载最近9封邮件")
+		fmt.Println("  ", os.Args[0], "-n                   离线: 重命名.里的eml并将信息写入:"+XmlPATH)
+		fmt.Println("  ", os.Args[0], "[-b] [-a] -f xx.eml  离线: 释放xx.eml中的[正文][附件]")
 		os.Exit(0)
 	}
-	bMakeDir2 := false // 以md5头两字符创建子文件夹
-	flag.BoolVar(&bMakeDir2, "sub", bMakeDir2, "以md5头两字符创建子文件夹")
-	bFixMD := false // 修复00_bakEmail.md，添加字段标题
-	flag.BoolVar(&bFixMD, "fix", bFixMD, "修复00_bakEmail.md，添加字段标题")
+	bRenameEmls := false
+	flag.BoolVar(&bRenameEmls, "n", bRenameEmls, "离线: 重命名.里的eml并将信息写入:"+XmlPATH)
 	var downCount int
 	flag.IntVar(&downCount, "da", -1, "倒序下载最近n封邮件")
 	var listCount int
@@ -59,15 +55,28 @@ func main() { // 下载邮件
 	flag.IntVar(&downIDX, "d", -1, "下载序列号为N的邮件并释放附件")
 	var deleteIDX int
 	flag.IntVar(&deleteIDX, "rm", -1, "删除序列号为N的邮件")
+
 	emlPath := "xx.eml"
-	flag.StringVar(&emlPath, "e", emlPath, "释放"+emlPath+"中的附件")
+	flag.StringVar(&emlPath, "f", emlPath, "离线: 释放"+emlPath+"中的[正文b][附件a]")
+	bExtractBody := false
+	flag.BoolVar(&bExtractBody, "b", bExtractBody, "释放eml中的正文")
+	bExtractAttachMent := false
+	flag.BoolVar(&bExtractAttachMent, "a", bExtractAttachMent, "释放eml中的附件")
+
 	flag.Parse() // 处理参数
 
-	if "xx.eml" != emlPath { // 释放附件
-		ExtractAttachmentsFromEml(emlPath)
+	if bRenameEmls {
+		renameEmlFiles()
+		os.Exit(0)
+	}
+	if "xx.eml" != emlPath {
+		fEML, _ := os.Open(emlPath) // 读取eml
+		emlParser(fEML, bExtractBody, bExtractAttachMent) // 释放 正文 附件
 		os.Exit(0)
 	}
 
+	NowMode := "blank" // NowMode: list, downAll, downOne, deleteOne
+	NID := 1
 	if downCount != -1 {
 		NowMode = "downAll"
 		NID = downCount
@@ -94,6 +103,12 @@ func main() { // 下载邮件
 		fmt.Println("- Error:", NID, "< 1")
 		os.Exit(1)
 	}
+
+	if "blank" == NowMode { // 参数不对或无参数
+		flag.Usage()
+		os.Exit(1)
+	}
+	// 下面是在线模式
 
 	// 环境变量
 	envSV := os.Getenv("eSvrPOP")
@@ -122,47 +137,18 @@ func main() { // 下载邮件
 		log.Fatal(err)
 	}
 
-	// 创建目录，进入目录
-	var LogFile *os.File
-	if "downAll" == NowMode || bFixMD {
-		err = os.Mkdir(WDir, 0750)
-		if err != nil && !os.IsExist(err) {
-			log.Fatal(err)
-		}
-		os.Chdir(WDir)
-		// 读取log，里面包含md5,len
-		logBytes, _ := os.ReadFile(LogPATH)
-		LogStr = string(logBytes)
-		if bFixMD {
-			os.Rename(LogPATH, LogPATH+".bak")
-		}
-		fLogtmp, err := os.OpenFile(LogPATH, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+	var XmlFile *os.File
+	XmlStr := ""
+	if "downAll" == NowMode {
+		// 读取 xml 里面包含的 eml 信息
+		xmlBytes, _ := os.ReadFile(XmlPATH)
+		XmlStr = string(xmlBytes)
+		fXmlTmp, err := os.OpenFile(XmlPATH, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 		if err != nil {
 			log.Fatal(err)
 		}
-		LogFile = fLogtmp
-		// defer LogFile.Close()
-
-		if bFixMD { // 读取*.eml，获取标题，添加到LogFile里面
-			scanner := bufio.NewScanner(strings.NewReader(LogStr))
-			for scanner.Scan() {
-				line := scanner.Text()
-				if strings.Contains(line, ",") {
-					ff := strings.Split(line, ",")
-					emlName := ff[0] + ".eml"
-					if FileExist(emlName) {
-						lineSub := strings.ReplaceAll(GetSubjectFromEml(emlName), ",", "，")
-						fmt.Printf("- %s %s : %s\n", ff[0], ff[1], lineSub)
-						if _, err := LogFile.WriteString(fmt.Sprintf("%s,%s,%s,\n", ff[0], ff[1], lineSub)); err != nil {
-							LogFile.Close() // ignore error; Write error takes precedence
-							log.Fatal(err)
-						}
-					}
-				}
-			}
-			LogFile.Close()
-			os.Exit(0)
-		}
+		XmlFile = fXmlTmp
+		// defer XmlFile.Close()
 	}
 
 	// 连接
@@ -184,35 +170,34 @@ func main() { // 下载邮件
 	}
 	fmt.Printf("# %s @ %s:%d  isTLS:%t\n", aUP[0], aEml[0], nPort, bTLS)
 
-	//	Print the total number of messages and their size.
 	count, size, _ := c.Stat()
 	fmt.Println("# total messages =", count, ", size =", size)
-
-	// Pull the list of all message IDs and their sizes.
-	// msgs, _ := c.List(0)
-	// for _, m := range msgs {
-	// 	fmt.Println("- id =", m.ID, ", size =", m.Size)
-	// }
 
 	if "downOne" == NowMode { // downIDX
 		if downIDX > count {
 			downIDX = count
 		}
 		if 0 != count {
-			m, _ := c.Retr(downIDX)
-			nowSubject := emlSubjectDecode(m.Header.Get("subject"))
-			fmt.Println("|", downIDX, ":", nowSubject)
+			emlPath := fmt.Sprintf("%d.eml", downIDX)
+			buf, _ := c.RetrRaw(downIDX)
+			saveEml(buf, emlPath) // 保存eml: ret: writeLen
 
-			ExtractAttachmentFromEntity(m)
+			if bExtractBody || bExtractAttachMent {
+				fEML, _ := os.Open(emlPath) // 读取eml
+				emlParser(fEML, bExtractBody, bExtractAttachMent) // 释放 正文 附件
+			} else {
+				fmt.Println("+", downIDX, ":", emlPath)
+			}
 		}
 	}
+
 	if "deleteOne" == NowMode { // deleteIDX
 		if deleteIDX > count {
 			deleteIDX = count
 		}
 		if 0 != count {
 			m, _ := c.Top(deleteIDX, 0) // 取头
-			nowSubject := emlSubjectDecode(m.Header.Get("subject"))
+			nowSubject, _ := m.Header.Text("subject")
 			fmt.Println("- 删除 :", deleteIDX, ":", nowSubject)
 
 			err = c.Dele(deleteIDX)
@@ -232,59 +217,43 @@ func main() { // 下载邮件
 			NID = 9
 		}
 
-		//		fmt.Println("- debug: count =", count, ", NID =", NID)
-		// Pull all messages on the server. Message IDs go from 1 to N.
-		// for id := NID; id <= count; id++ {
 		for id := count; id >= NID; id-- {
-			m, _ := c.Top(id, 0) // 取头
-			nowSubject := emlSubjectDecode(m.Header.Get("subject"))
-			fmt.Println("|", id, ":", nowSubject)
+			bDownEML := true // 通过判断xml中是否包含UID来确定是否下载eml
+			nowUID := "" // 当前UID
+			aUID, _ := c.Uidl(id)
+			if 1 == len(aUID) {
+				nowUID = aUID[0].UID
+			}
+			if len(nowUID) > 1 && strings.Contains(XmlStr, nowUID) {
+				bDownEML = false
+			}
 
-			if "downAll" == NowMode {
+			m, _ := c.Top(id, 0) // 取头
+			ei := NewEmlInfoFromMessageHeader(m.Header).SetUID(nowUID)
+
+			fmt.Println("|", id, ":", ei.GetLocalTime(), ":", ei.Subject, ":", ei.From, ":", nowUID)
+
+			if "downAll" == NowMode && bDownEML {
 				buf, _ := c.RetrRaw(id)
 
-				emlPath := fmt.Sprintf("%d.eml", id)
-				f, err := os.OpenFile(emlPath, os.O_RDWR|os.O_CREATE, 0755)
-				if err != nil {
+				emlName0 := fmt.Sprintf("00_tmp_%d.eml", id) // 初始名称: 后面会更名
+				writeLen := saveEml(buf, emlName0) // 保存eml
+				ei.SetLength(writeLen)
+				emlName1 := ei.GetFileName1()
+				os.Rename(emlName0, emlName1) // 第1次重命名
+				emlName2 := ei.GetFileName2()
+				os.Rename(emlName1, emlName2) // 第2次重命名
+				fmt.Printf("+ %d : %s\n", id, emlName2)
+
+				if _, err := XmlFile.WriteString(ei.GetXMLLine()); err != nil {
+					XmlFile.Close()
 					log.Fatal(err)
-				}
-
-				// m.WriteTo(f)
-				writeLen, _ := buf.WriteTo(f)
-
-				if err := f.Close(); err != nil {
-					log.Fatal(err)
-				}
-
-				// 计算文件的md5，重命名
-				nowMD5 := getFileMd5(emlPath)
-
-				// 如果同文件存在，删除，否则，重命名
-				if bHaveSameFile(nowMD5, fmt.Sprint(writeLen)) {
-					os.Remove(emlPath)
-					fmt.Printf("- %d : md5 = %s , len = %d\n", id, nowMD5, writeLen)
-				} else { // 不存在，重命名
-					dirName := ""
-					if bMakeDir2 {
-						dirName = nowMD5[0:2]
-						err = os.Mkdir(dirName, 0750)
-						if err != nil && !os.IsExist(err) {
-							log.Fatal(err)
-						}
-						dirName = dirName + "/"
-					}
-					os.Rename(emlPath, dirName+nowMD5+".eml")
-					fmt.Printf("+ %d : md5 = %s , len = %d\n", id, nowMD5, writeLen)
-					if _, err := LogFile.WriteString(fmt.Sprintf("%s,%d,%s,\n", nowMD5, writeLen, nowSubject)); err != nil {
-						LogFile.Close() // ignore error; Write error takes precedence
-						log.Fatal(err)
-					}
 				}
 			} // downAll
 		}
 
 		if "downAll" == NowMode {
-			if err := LogFile.Close(); err != nil {
+			if err := XmlFile.Close(); err != nil {
 				log.Fatal(err)
 			}
 		}
@@ -293,191 +262,305 @@ func main() { // 下载邮件
 	fmt.Println("# total messages =", count, ", size =", size)
 }
 
-func GetSubjectFromEml(iPath string) string {
-	// 打开eml文件
-	fTest, err := os.OpenFile(iPath, os.O_RDONLY, 0644)
-	if err != nil {
-		fmt.Println("- Error @ GetSubjectFromEml : OpenFile :", err)
+func niceFileName(iStr string) string {
+	iStr = strings.Replace(iStr, "*", "※", -1)
+	iStr = strings.Replace(iStr, "\\", "﹨", -1)
+	iStr = strings.Replace(iStr, "|", "｜", -1)
+	iStr = strings.Replace(iStr, ":", "︰", -1)
+	iStr = strings.Replace(iStr, "\"", "¨", -1)
+	iStr = strings.Replace(iStr, "<", "〈", -1)
+	iStr = strings.Replace(iStr, ">", "〉", -1)
+	iStr = strings.Replace(iStr, "/", "／", -1)
+	iStr = strings.Replace(iStr, "?", "？", -1)
+	return iStr
+}
+
+func stupidDate(sDate string) (time.Time, error) { // 中文月份替换为英文 "16 九月 2023 12:38:01 +/-TZ" -> "16 Sep 2023 12:38:01 +0800"
+	if strings.Contains(sDate, "+/-TZ") {
+		sDate = strings.Replace(sDate, "+/-TZ", "+0800", -1)
+
+		sDate = strings.Replace(sDate, "十一月", "Nov", -1)
+		sDate = strings.Replace(sDate, "11月", "Nov", -1)
+		sDate = strings.Replace(sDate, "十二月", "Dec", -1)
+		sDate = strings.Replace(sDate, "12月", "Dec", -1)
+
+		sDate = strings.Replace(sDate, "一月", "Jan", -1)
+		sDate = strings.Replace(sDate, "1月", "Jan", -1)
+		sDate = strings.Replace(sDate, "二月", "Feb", -1)
+		sDate = strings.Replace(sDate, "2月", "Feb", -1)
+		sDate = strings.Replace(sDate, "三月", "Mar", -1)
+		sDate = strings.Replace(sDate, "3月", "Mar", -1)
+		sDate = strings.Replace(sDate, "四月", "Apr", -1)
+		sDate = strings.Replace(sDate, "4月", "Apr", -1)
+		sDate = strings.Replace(sDate, "五月", "May", -1)
+		sDate = strings.Replace(sDate, "5月", "May", -1)
+		sDate = strings.Replace(sDate, "六月", "Jun", -1)
+		sDate = strings.Replace(sDate, "6月", "Jun", -1)
+		sDate = strings.Replace(sDate, "七月", "Jul", -1)
+		sDate = strings.Replace(sDate, "7月", "Jul", -1)
+		sDate = strings.Replace(sDate, "八月", "Aug", -1)
+		sDate = strings.Replace(sDate, "8月", "Aug", -1)
+		sDate = strings.Replace(sDate, "九月", "Sep", -1)
+		sDate = strings.Replace(sDate, "9月", "Sep", -1)
+		sDate = strings.Replace(sDate, "十月", "Oct", -1)
+		sDate = strings.Replace(sDate, "10月", "Oct", -1)
 	}
-	defer fTest.Close()
+	return mail.ParseDate(sDate)
+}
 
-	// 解析eml
-	m, err := message.Read(fTest)
-	if err != nil {
-		fmt.Println("- Error @ GetSubjectFromEml : message.Read :", err)
+// 这个函数改自: github.com/emersion/go-message/mail/header.go
+func emlDate(strDate string) (time.Time, error) {
+	if strDate == "" {
+		return time.Time{}, nil
 	}
-	subRaw := m.Header.Get("subject")
-
-	return emlSubjectDecode(subRaw)
+//	return mail.ParseDate(strDate)
+	return stupidDate(strDate)
 }
 
-func FileExist(filename string) bool {
-	_, err := os.Stat(filename)
-	return err == nil || os.IsExist(err)
-}
+// 读取eml，获取信息，释放正文和附件
+func emlParser(r io.Reader, bExtractBody bool, bExtractAttachMent bool) {
+	mr, _ := eml.CreateReader(r)
 
-func bHaveSameFile(iMD5 string, iLen string) bool {
-	return strings.Contains(LogStr, iMD5+","+iLen+",")
-}
+//	iFrom, _ := mr.Header.AddressList("From") // []*Address
+	iFrom, _ := mr.Header.Text("From")
+	fmt.Println("# From:", iFrom)
 
-func getFileMd5(filename string) string {
-	pFile, err := os.Open(filename)
-	if err != nil {
-		fmt.Errorf("文件: %v 打开失败，err: %v", filename, err)
-		return ""
+	sTo, _ := mr.Header.Text("To")
+	fmt.Println("# To:", sTo)
+
+	sCC, _ := mr.Header.Text("CC")
+	if len(sCC) > 0 {
+		fmt.Println("# CC:", sCC)
 	}
-	defer pFile.Close()
-	md5h := md5.New()
-	io.Copy(md5h, pFile)
-	return hex.EncodeToString(md5h.Sum(nil))
-}
 
-func GBK2UTF8(gbkStr string) string {
-	utf8Str, _ := simplifiedchinese.GBK.NewDecoder().String(gbkStr)
-	return utf8Str
-}
-
-func emlSubjectDecode(iSubject string) string {
-	sSub := iSubject
-	if strings.Contains(iSubject, "?B?") || strings.Contains(iSubject, "?b?") {
-		sSub = ""
-		matches := regexp.MustCompile("(?smi)=\\?([^\\?]+)\\?B\\?([^\\?]+)\\?=").FindAllStringSubmatch(iSubject, -1)
-		for _, match := range matches {
-			sDec, err := base64.StdEncoding.DecodeString(match[2])
-			if err != nil {
-				fmt.Println("- Error @ emlSubjectDecode : deCode Base64 :", iSubject)
-			}
-			encUP := strings.ToUpper(match[1])
-			if encUP == "GBK" || encUP == "GB2312" || encUP == "GB18030" {
-				sSub = sSub + GBK2UTF8(string(sDec))
-			} else if encUP == "UTF-8" || encUP == "UTF8" {
-				sSub = sSub + string(sDec)
-			} else {
-				// TODO
-				fmt.Println("- Warning @ emlSubjectDecode : deCode Base64 :", iSubject)
-				sSub = iSubject
-				// sSub = sSub + string(sDec)
-			}
-		}
-	} else if strings.Contains(iSubject, "?Q?") || strings.Contains(iSubject, "?q?") {
-		sQStr := ""
-		sSub = ""
-		matches := regexp.MustCompile("(?smi)=\\?([^\\?]+)\\?Q\\?([^\\?]+)\\?=").FindAllStringSubmatch(iSubject, -1)
-		for _, match := range matches {
-			if strings.ToUpper(match[1]) != "UTF-8" {
-				fmt.Println("- Error @ emlSubjectDecode : deCode Q 非UTF-8编码 :", match[1], sSub)
-				continue
-			}
-			sSub = match[2]
-			lenSub := len(sSub)
-
-			// "_"替换为" ", "=FF=FF=FF":cnUTF8字符      "=":0x61  "_":0x95
-			oStr := ""
-			n := 0
-			for {
-				if n >= lenSub {
-					break
-				}
-				if 61 == sSub[n] { // '='
-					if n+3 > lenSub {
-						fmt.Println("- Warning: 无法解码的神奇的字符串: ", sSub)
-						break
-					}
-					/*
-					   UTF-8:4字节
-					   1: 0-127
-					   2: 192-223, 128-191
-					   3: 224-239, 128-191, 128-191
-					   4: 240-247, 128-191, 128-191, 128-191
-					*/
-					// 测试首字符
-					whiByte, _ := hex.DecodeString(string(sSub[n+1]) + string(sSub[n+2]))
-					whiChar := whiByte[0]
-					// fmt.Println("- n =", n, "lenSub =", lenSub, "whiChar =", whiChar)
-					if whiChar < 128 { // 1字节 ascii
-						enChar, _ := hex.DecodeString(string(sSub[n+1]) + string(sSub[n+2]))
-						oStr = oStr + string(enChar)
-						n = n + 3
-					} else if whiChar < 224 { // 2字节
-						thChar, _ := hex.DecodeString(string(sSub[n+1]) + string(sSub[n+2]) + string(sSub[n+4]) + string(sSub[n+5]))
-						oStr = oStr + string(thChar)
-						n = n + 6
-					} else if whiChar < 240 { // 3字节: cn
-						cnChar, _ := hex.DecodeString(string(sSub[n+1]) + string(sSub[n+2]) + string(sSub[n+4]) + string(sSub[n+5]) + string(sSub[n+7]) + string(sSub[n+8]))
-						oStr = oStr + string(cnChar)
-						n = n + 9
-					} else {
-						foChar, _ := hex.DecodeString(string(sSub[n+1]) + string(sSub[n+2]) + string(sSub[n+4]) + string(sSub[n+5]) + string(sSub[n+7]) + string(sSub[n+8]) + string(sSub[n+10]) + string(sSub[n+11]))
-						oStr = oStr + string(foChar)
-						n = n + 12
-					}
-				} else if 95 == sSub[n] { // '_'
-					oStr = oStr + " "
-					n = n + 1
-				} else { // 未转义字符
-					oStr = oStr + string(sSub[n])
-					n = n + 1
-				}
-			}
-			sQStr = sQStr + oStr
-		}
-		sSub = sQStr
+	sBCC, _ := mr.Header.Text("Bcc")
+	if len(sBCC) > 0 {
+		fmt.Println("# BCC:", sBCC)
 	}
-	return sSub
-}
 
-func ExtractAttachmentsFromEml(iPath string) {
-	// 打开eml文件
-	fTest, err := os.OpenFile(iPath, os.O_RDONLY, 0644)
-	if err != nil {
-		fmt.Println("- Error @ ExtractAttachmentsFromEml : OpenFile :", err)
-	}
-	defer fTest.Close()
+	iDate, _    := emlDate(mr.Header.Get("date"))
+	iSubject, _ := mr.Header.Text("subject")
 
-	// 解析eml
-	m, err := message.Read(fTest)
-	if err != nil {
-		fmt.Println("- Error @ ExtractAttachmentsFromEml : message.Read :", err)
-	}
-	subRaw := m.Header.Get("subject")
-	// fmt.Println("- len(subject):", len(subRaw))
-	// fmt.Println("- subject:", subRaw)
+	fmt.Println("# Date:", iDate)
+	fmt.Println("# LocalDate:", iDate.Local())
+	fmt.Println("# TimeStamp:", iDate.Unix())
+	fmt.Println("# Subject:", iSubject)
 
-	fmt.Println("# subject:", emlSubjectDecode(subRaw))
+	fmt.Println("---------------------")
 
-	ExtractAttachmentFromEntity(m)
-}
-
-func ExtractAttachmentFromEntity(m *message.Entity) {
-	mr := m.MultipartReader()
+	inlineCount := 0
 	for {
-		nextEnt, err := mr.NextPart()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			fmt.Println("- Error @ ExtractAttachmentFromEntity : NextPart :", err)
+		p, err := mr.NextPart() // *Part
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			fmt.Println(err)
 		}
-		if "" != nextEnt.Header.Get("Content-Disposition") { // 附件
-			_, aa, err := nextEnt.Header.ContentDisposition()
-			if err != nil {
-				fmt.Println("- Error @ ExtractAttachmentFromEntity : nextEnt.Header.ContentDisposition() :", err)
-			}
-			fileName := emlSubjectDecode(aa["filename"]) // 附件文件名
-			// fmt.Println("- Content-Type:", nextEnt.Header.Get("Content-Type"))
-			fmt.Println("- Content-Disposition:", nextEnt.Header.Get("Content-Disposition"))
-			// fmt.Println("  - cs:", cs)
-			// fmt.Println("  - aa:", aa)
 
-			f, err := os.OpenFile(fileName, os.O_RDWR|os.O_CREATE, 0755)
-			if err != nil {
-				fmt.Println("- Error @ ExtractAttachmentFromEntity : OpenFile :", err)
+		switch h := p.Header.(type) {
+		case *eml.InlineHeader:
+			inlineCount = 1 + inlineCount
+
+			oExt := ".txt"
+			ct, ctpar, _ := h.ContentType() // (t string, params map[string]string, err error)
+			if strings.Contains(ct, "html") {
+				oExt = ".html"
 			}
-			fLen, err := io.Copy(f, nextEnt.Body)
-			if err != nil {
-				fmt.Println("- Error @ ExtractAttachmentFromEntity : io.Copy :", err)
+			if strings.Contains(ct, "image/") {
+				picName, err := getInlineFilename(h) // 自己写的
+				if err != nil {
+					oExt = ".jpg"
+					aExt, _ := mime.ExtensionsByType(ct)
+					if len(aExt) > 0 {
+						oExt = aExt[0]
+					}
+				}
+				if "" != picName && bExtractBody {
+					fmt.Printf("# %d.%s : %s : %v\n", inlineCount, picName, ct, ctpar)
+					b, _ := ioutil.ReadAll(p.Body)
+					os.WriteFile(fmt.Sprintf("%d.%s", inlineCount, picName), b, 0666)
+					continue
+				}
 			}
-			fmt.Println("  - WriteTo :", fileName, ", FileLen :", fLen) // 附件文件名
+
+			fmt.Printf("# %d%s : %s : %v\n", inlineCount, oExt, ct, ctpar)
+			if bExtractBody {
+				b, _ := ioutil.ReadAll(p.Body)
+				os.WriteFile(fmt.Sprintf("%d%s", inlineCount, oExt), b, 0666)
+			}
+		case *eml.AttachmentHeader:
+			act, actpar, _ := h.ContentType() // (t string, params map[string]string, err error)
+			filename, _ := h.Filename()
+
+			fmt.Printf("# %s : %s : %v\n", filename, act, actpar)
+			if bExtractAttachMent {
+				oFile, err := os.Create(filename)
+				if err != nil {
+					fmt.Println(err)
+				}
+				if _, err := io.Copy(oFile, p.Body); err != nil {
+					fmt.Println(err)
+				}
+			}
 		}
 	}
 }
+
+// inline类型的附件，例如图片类型
+func getInlineFilename(h *eml.InlineHeader) (string, error) {
+	_, params, err := h.ContentDisposition()
+	filename, ok := params["filename"]
+	if !ok {
+		_, params, err = h.ContentType()
+		filename = params["name"]
+	}
+	return filename, err
+}
+
+// 将buf写入emlPath
+func saveEml(buf *bytes.Buffer, emlPath string) int64 {
+	f, err := os.OpenFile(emlPath, os.O_RDWR|os.O_CREATE, 0755)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	writeLen, _ := buf.WriteTo(f)
+
+	if err := f.Close(); err != nil {
+		log.Fatal(err)
+	}
+	return writeLen
+}
+
+func getFileSize(fileName string) int64 {
+    fileInfo, err := os.Stat(fileName)
+    if err!= nil {
+        fmt.Println("获取文件信息时出错:", err)
+        return 0
+    }
+    return fileInfo.Size()
+}
+
+func renameEml(emlName string) string {
+	writeLen := getFileSize(emlName)
+
+	r, _ := os.Open(emlName) // 读取eml
+	mr, _ := eml.CreateReader(r)
+
+	ei := NewEmlInfoFromMailHeader(mr.Header).SetLength(writeLen).SetUID(emlName)
+
+	mr.Close()
+	r.Close()
+
+	lTime := ei.Date.Local()
+	if err := os.Chtimes(emlName, lTime, lTime); err != nil {
+		fmt.Println(err)
+	}
+
+
+	emlName1 := ei.GetFileName1()
+	emlName2 := ei.GetFileName2()
+	if emlName != emlName2 {
+		fmt.Println(emlName, "->", emlName2)
+		err := os.Rename(emlName, emlName1) // 第1次重命名
+    	if err!= nil {
+			fmt.Println(err)
+		}
+		err = os.Rename(emlName1, emlName2) // 第2次重命名
+    	if err!= nil {
+			fmt.Println(err)
+		}
+	}
+
+	return ei.GetXMLLine()
+}
+
+func renameEmlFiles() {
+    // 获取当前目录
+    currentDir, err := os.Getwd()
+    if err!= nil {
+        log.Fatal(err)
+    }
+
+    // 遍历当前目录下的所有文件
+    files, err := ioutil.ReadDir(currentDir)
+    if err!= nil {
+        log.Fatal(err)
+    }
+
+	var buf bytes.Buffer
+    for _, file := range files {
+        if filepath.Ext(file.Name()) == ".eml" {
+			buf.WriteString(renameEml(file.Name()))
+        }
+    }
+
+	err = os.WriteFile(XmlPATH, buf.Bytes(), os.ModePerm)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+type EmlInfo struct {
+	Date      time.Time
+	Subject   string
+	From      string
+	To        string
+	UID       string
+	Length    int64
+}
+
+func (ei *EmlInfo) GetUnix() int64 {
+	return ei.Date.Unix()
+}
+
+func (ei *EmlInfo) GetLocalTime() string {
+	return ei.Date.Local().Format("2006-01-02_15.04.05")
+}
+
+func (ei *EmlInfo) GetNiceSubjct() string {
+	return niceFileName(ei.Subject)
+}
+
+func (ei *EmlInfo) GetFileName1() string { // 一阶段文件名
+	return fmt.Sprintf("%d_%s_%d.eml", ei.GetUnix(), ei.GetLocalTime(), ei.Length)
+}
+
+func (ei *EmlInfo) GetFileName2() string { // 二阶段文件名
+	return fmt.Sprintf("%d_%s_%d_%s.eml", ei.GetUnix(), ei.GetLocalTime(), ei.Length, ei.GetNiceSubjct())
+}
+
+func (ei *EmlInfo) GetXMLLine() string { // 一行xml信息
+	return fmt.Sprintf("<mail><ts>%d</ts><time>%s</time><size>%d</size><subject>%s</subject><from>%s</from><to>%s</to><mid>%s</mid></mail>\n", ei.GetUnix(), ei.GetLocalTime(), ei.Length, ei.Subject, ei.From, ei.To, ei.UID)
+}
+
+func (ei *EmlInfo) SetUID(iUID string) *EmlInfo {
+	ei.UID = iUID
+	return ei
+}
+
+func (ei *EmlInfo) SetLength(iLen int64) *EmlInfo {
+	ei.Length = iLen
+	return ei
+}
+
+func NewEmlInfo(iDate time.Time, iSubject string, iFrom string, iTo string, iUID string, iLen int64) *EmlInfo { // 创建EmlInfo
+	return &EmlInfo{Date: iDate, Subject: iSubject, From: iFrom, To: iTo, UID: iUID, Length: iLen}
+}
+
+func NewEmlInfoFromMailHeader(h eml.Header) *EmlInfo { // 从header创建EmlInfo
+	iSubject, _ := h.Text("subject")
+	iDate, _    := emlDate(h.Get("date"))
+	iFrom, _    := h.Text("from")
+	iTo, _      := h.Text("to")
+	return &EmlInfo{Date: iDate, Subject: iSubject, From: iFrom, To: iTo}
+}
+
+func NewEmlInfoFromMessageHeader(h msg.Header) *EmlInfo { // 从header创建EmlInfo
+	iSubject, _ := h.Text("subject")
+	iDate, _    := emlDate(h.Get("date"))
+	iFrom, _    := h.Text("from")
+	iTo, _      := h.Text("to")
+	return &EmlInfo{Date: iDate, Subject: iSubject, From: iFrom, To: iTo}
+}
+
