@@ -22,8 +22,9 @@ import (
 )
 
 var (
-	VerStr  string = "2024-07-12.17"
-	XmlPATH string = "00_Emails.xml"
+	VerStr  string = "2024-08-07.10"
+	XmlOnlinePATH  string = "00_eml_online.xml"
+	XmlOfflinePATH string = "00_eml_offline.xml"
 )
 
 
@@ -41,12 +42,12 @@ func main() { // 下载邮件
 		fmt.Println("  ", os.Args[0], "[-b] [-a] -d 1       下载序列号为1的邮件并释放[正文][附件]")
 		fmt.Println("  ", os.Args[0], "-rm 1                删除序列号为1的邮件")
 		fmt.Println("  ", os.Args[0], "-da 9                倒序下载最近9封邮件")
-		fmt.Println("  ", os.Args[0], "-n                   离线: 重命名.里的eml并将信息写入:"+XmlPATH)
+		fmt.Println("  ", os.Args[0], "-n                   离线: 重命名.里的eml并将信息写入:"+XmlOfflinePATH)
 		fmt.Println("  ", os.Args[0], "[-b] [-a] -f xx.eml  离线: 释放xx.eml中的[正文][附件]")
 		os.Exit(0)
 	}
 	bRenameEmls := false
-	flag.BoolVar(&bRenameEmls, "n", bRenameEmls, "离线: 重命名.里的eml并将信息写入:"+XmlPATH)
+	flag.BoolVar(&bRenameEmls, "n", bRenameEmls, "离线: 重命名.里的eml并将信息写入:"+XmlOfflinePATH)
 	var downCount int
 	flag.IntVar(&downCount, "da", -1, "倒序下载最近n封邮件")
 	var listCount int
@@ -141,9 +142,9 @@ func main() { // 下载邮件
 	XmlStr := ""
 	if "downAll" == NowMode {
 		// 读取 xml 里面包含的 eml 信息
-		xmlBytes, _ := os.ReadFile(XmlPATH)
+		xmlBytes, _ := os.ReadFile(XmlOnlinePATH)
 		XmlStr = string(xmlBytes)
-		fXmlTmp, err := os.OpenFile(XmlPATH, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+		fXmlTmp, err := os.OpenFile(XmlOnlinePATH, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -495,7 +496,7 @@ func renameEmlFiles() {
         }
     }
 
-	err = os.WriteFile(XmlPATH, buf.Bytes(), os.ModePerm)
+	err = os.WriteFile(XmlOfflinePATH, buf.Bytes(), os.ModePerm)
 	if err != nil {
 		log.Fatal(err)
 	}
