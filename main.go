@@ -25,7 +25,7 @@ import (
 )
 
 var (
-	VerStr  string = "2024-08-07.16"
+	VerStr  string = "2024-08-08.15"
 	XmlOnlinePATH  string = "00_eml_online.xml"
 	XmlOfflinePATH string = "00_eml_offline.xml"
 )
@@ -47,7 +47,7 @@ func main() { // 下载邮件
 		fmt.Println("  ", os.Args[0], "-da 9                倒序下载最近9封邮件")
 		fmt.Println("  ", os.Args[0], "-n                   离线: 重命名.里的eml并将信息写入:"+XmlOfflinePATH)
 		fmt.Println("  ", os.Args[0], "[-b] [-a] -f xx.eml  离线: 释放xx.eml中的[正文][附件]")
-		fmt.Println("  ", os.Args[0], "-p xx.eml            离线: 读取eml中附件位置信息")
+		fmt.Println("  ", os.Args[0], "-p xx.eml [-i 0]     离线: 查看/清理eml中附件")
 		os.Exit(0)
 	}
 	bRenameEmls := false
@@ -62,7 +62,9 @@ func main() { // 下载邮件
 	flag.IntVar(&deleteIDX, "rm", -1, "删除序列号为N的邮件")
 
 	emlPosPath := "xx.eml"
-	flag.StringVar(&emlPosPath, "p", emlPosPath, "读取" + emlPosPath + "中附件位置信息")
+	flag.StringVar(&emlPosPath, "p", emlPosPath, "离线: 读取" + emlPosPath + "中附件位置信息")
+	var clearIDX int
+	flag.IntVar(&clearIDX, "i", -1, "离线: 清理序号为N的附件，0=所有，N=序号")
 
 	emlPath := "xx.eml"
 	flag.StringVar(&emlPath, "f", emlPath, "离线: 释放"+emlPath+"中的[正文b][附件a]")
@@ -78,7 +80,7 @@ func main() { // 下载邮件
 		os.Exit(0)
 	}
 	if "xx.eml" != emlPosPath {
-		emlAttachPos(emlPosPath)
+		emlAttachPos(emlPosPath, clearIDX)
 		os.Exit(0)
 	}
 	if "xx.eml" != emlPath {
@@ -358,20 +360,21 @@ func emlParser(r io.Reader, bExtractBody bool, bExtractAttachMent bool) {
 	fmt.Println("# TimeStamp:", iDate.Unix())
 	fmt.Println("# Subject:", iSubject)
 
-	fmt.Println("---------------------")
+	fmt.Println("  -----")
 
 	inlineCount := 0
+	attachCount := 0
 	for {
 		p, err := mr.NextPart() // *Part
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			fmt.Println(err)
+			fmt.Fprintln(os.Stderr, err)
 		}
 
 		switch h := p.Header.(type) {
 		case *eml.InlineHeader:
-			inlineCount = 1 + inlineCount
+			inlineCount++
 
 			oExt := ".txt"
 			ct, ctpar, _ := h.ContentType() // (t string, params map[string]string, err error)
@@ -391,23 +394,27 @@ func emlParser(r io.Reader, bExtractBody bool, bExtractAttachMent bool) {
 					oExt = "." + picName
 				}
 				if "" != picName && bExtractBody {
-					fmt.Printf("# %d.%s : %s : %v\n", inlineCount, picName, ct, ctpar)
+//					fmt.Printf("# %d.%s : %s : %v\n", inlineCount, picName, ct, ctpar)
+					fmt.Printf("# %d.%s : %v\n", inlineCount, picName, ctpar)
 					b, _ := ioutil.ReadAll(p.Body)
 					os.WriteFile(fmt.Sprintf("%d.%s", inlineCount, picName), b, 0666)
 					continue
 				}
 			}
 
-			fmt.Printf("# %d%s : %s : %v\n", inlineCount, oExt, ct, ctpar)
+//			fmt.Printf("# %d%s : %s : %v\n", inlineCount, oExt, ct, ctpar)
+			fmt.Printf("# %d%s : %v\n", inlineCount, oExt, ctpar)
 			if bExtractBody {
 				b, _ := ioutil.ReadAll(p.Body)
 				os.WriteFile(fmt.Sprintf("%d%s", inlineCount, oExt), b, 0666)
 			}
 		case *eml.AttachmentHeader:
-			act, actpar, _ := h.ContentType() // (t string, params map[string]string, err error)
+			attachCount++
+//			act, actpar, _ := h.ContentType()
 			filename, _ := h.Filename()
 
-			fmt.Printf("# %s : %s : %v\n", filename, act, actpar)
+//			fmt.Printf("# %s : %s : %v\n", filename, act, actpar)
+			fmt.Printf("# %d: %s\n", attachCount, filename)
 			if bExtractAttachMent {
 				oFile, err := os.Create(filename)
 				if err != nil {
@@ -579,13 +586,15 @@ func NewEmlInfoFromMessageHeader(h msg.Header) *EmlInfo { // 从header创建EmlI
 	return &EmlInfo{Date: iDate, Subject: iSubject, From: iFrom, To: iTo}
 }
 
-func emlAttachPos(emlPath string) {
+func emlAttachPos(emlPath string, cIDX int) { // cIDX: -1: 不清理 0:清理所有 n:清理序号为n的附件
 	fEML, err := os.Open(emlPath) // 读取eml
 	if err != nil {
 		fmt.Println("# Error: 打开文件错误:", err)
 		return
 	}
 	defer fEML.Close()
+
+	var buf bytes.Buffer // 新的eml
 
 	scanner := bufio.NewScanner(fEML)
 	lineNumber := 0
@@ -617,9 +626,14 @@ func emlAttachPos(emlPath string) {
 				bAttachStart = false
 				bAttachEnd = true
 				// 预估大小 = 每行76字符 * 0.75 = 57 字节
-				fmt.Println("- 附件:", attachCount, "起止行号:", attachStartNum, "-", attachEndNum, "预估大小:", 57 * ( attachEndNum - attachStartNum ), "附件名:", getAttachFileName(nowAttachLine))
+//				fmt.Println("- 附件:", attachCount, "预估大小:", 57 * ( attachEndNum - attachStartNum ), "附件名:", getAttachFileName(nowAttachLine), "起止行号:", attachStartNum, "-", attachEndNum)
+				fmt.Printf("- %d: 大小: %5d K  附件名: %s  起止行: %d-%d\n", attachCount, 57 * ( attachEndNum - attachStartNum ) / 1024, getAttachFileName(nowAttachLine), attachStartNum, attachEndNum)
 			}
 //			fmt.Println("- 分段行号:", lineNumber, line)
+			if -1 != cIDX {
+				buf.WriteString(line)
+				buf.WriteString("\r\n")
+			}
 			continue
 		}
 		if strings.Contains(line, "attachment") { // Content-Disposition: attachment; filename="=?UTF-8?B?MjAyNDA3MjbkGRm?="
@@ -632,6 +646,10 @@ func emlAttachPos(emlPath string) {
 			bAttachStart = true
 			bAttachEnd = false
 //			fmt.Println("- 附件行号:", lineNumber, line)
+			if -1 != cIDX {
+				buf.WriteString(line)
+				buf.WriteString("\r\n")
+			}
 			continue
 		}
 		if len(line) == 0 {
@@ -640,12 +658,47 @@ func emlAttachPos(emlPath string) {
 				bAttachEnd = true
 			}
 //			fmt.Println("- 空行行号:", lineNumber)
+			if -1 != cIDX {
+				buf.WriteString("\r\n")
+			}
 			continue
 		}
-	}
+		// 非特殊行的处理
+		if -1 == cIDX {
+			continue
+		} else if 0 == cIDX { // 清理所有
+			if attachCount > 0 {
+				if ! bAttachEnd {
+					buf.WriteString(line)
+					buf.WriteString("\r\n")
+				}
+			} else {
+				buf.WriteString(line)
+				buf.WriteString("\r\n")
+			}
+		} else if attachCount == cIDX { // 清理单个
+// fmt.Println(lineNumber, bAttachStart, bAttachEnd, attachStartNum, attachEndNum)
+			if ! bAttachEnd {
+				buf.WriteString(line)
+				buf.WriteString("\r\n")
+			}
+		} else {
+			buf.WriteString(line)
+			buf.WriteString("\r\n")
+		}
+	} // end of scan
 
 	if err := scanner.Err(); err!= nil {
 		fmt.Println("# Error: 扫描文件时出错:", err)
+	}
+	if -1 != cIDX {
+		err = os.WriteFile(emlPath + ".new", buf.Bytes(), os.ModePerm)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
+		fEML.Close()
+		os.Rename(emlPath, emlPath + ".old")
+		os.Rename(emlPath + ".new", emlPath)
 	}
 }
 
@@ -675,7 +728,7 @@ func decodeEncodedWord(s string) string {
 	return header
 }
 
-func getAttachFileName(attachLine string) string { // Content-Disposition: attachment; filename="=?UTF-8?B?aaaabbbbb?="
+func getAttachFileName(attachLine string) string {
 	if ! strings.Contains(attachLine, "filename") {
 		return attachLine
 	}
