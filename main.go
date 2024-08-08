@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/mail"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,10 +21,11 @@ import (
 	eml "github.com/emersion/go-message/mail"
 	_ "github.com/emersion/go-message/charset"
 	"github.com/knadh/go-pop3"
+
 )
 
 var (
-	VerStr  string = "2024-08-07.10"
+	VerStr  string = "2024-08-07.16"
 	XmlOnlinePATH  string = "00_eml_online.xml"
 	XmlOfflinePATH string = "00_eml_offline.xml"
 )
@@ -44,6 +47,7 @@ func main() { // 下载邮件
 		fmt.Println("  ", os.Args[0], "-da 9                倒序下载最近9封邮件")
 		fmt.Println("  ", os.Args[0], "-n                   离线: 重命名.里的eml并将信息写入:"+XmlOfflinePATH)
 		fmt.Println("  ", os.Args[0], "[-b] [-a] -f xx.eml  离线: 释放xx.eml中的[正文][附件]")
+		fmt.Println("  ", os.Args[0], "-p xx.eml            离线: 读取eml中附件位置信息")
 		os.Exit(0)
 	}
 	bRenameEmls := false
@@ -57,6 +61,9 @@ func main() { // 下载邮件
 	var deleteIDX int
 	flag.IntVar(&deleteIDX, "rm", -1, "删除序列号为N的邮件")
 
+	emlPosPath := "xx.eml"
+	flag.StringVar(&emlPosPath, "p", emlPosPath, "读取" + emlPosPath + "中附件位置信息")
+
 	emlPath := "xx.eml"
 	flag.StringVar(&emlPath, "f", emlPath, "离线: 释放"+emlPath+"中的[正文b][附件a]")
 	bExtractBody := false
@@ -68,6 +75,10 @@ func main() { // 下载邮件
 
 	if bRenameEmls {
 		renameEmlFiles()
+		os.Exit(0)
+	}
+	if "xx.eml" != emlPosPath {
+		emlAttachPos(emlPosPath)
 		os.Exit(0)
 	}
 	if "xx.eml" != emlPath {
@@ -375,6 +386,9 @@ func emlParser(r io.Reader, bExtractBody bool, bExtractAttachMent bool) {
 					if len(aExt) > 0 {
 						oExt = aExt[0]
 					}
+				} else {
+//					oExt = filepath.Ext(picName)
+					oExt = "." + picName
 				}
 				if "" != picName && bExtractBody {
 					fmt.Printf("# %d.%s : %s : %v\n", inlineCount, picName, ct, ctpar)
@@ -434,12 +448,12 @@ func saveEml(buf *bytes.Buffer, emlPath string) int64 {
 }
 
 func getFileSize(fileName string) int64 {
-    fileInfo, err := os.Stat(fileName)
-    if err!= nil {
-        fmt.Println("获取文件信息时出错:", err)
-        return 0
-    }
-    return fileInfo.Size()
+	fileInfo, err := os.Stat(fileName)
+	if err != nil {
+		fmt.Println("获取文件信息时出错:", err)
+		return 0
+	}
+	return fileInfo.Size()
 }
 
 func renameEml(emlName string) string {
@@ -464,11 +478,11 @@ func renameEml(emlName string) string {
 	if emlName != emlName2 {
 		fmt.Println(emlName, "->", emlName2)
 		err := os.Rename(emlName, emlName1) // 第1次重命名
-    	if err!= nil {
+		if err != nil {
 			fmt.Println(err)
 		}
 		err = os.Rename(emlName1, emlName2) // 第2次重命名
-    	if err!= nil {
+		if err != nil {
 			fmt.Println(err)
 		}
 	}
@@ -477,24 +491,24 @@ func renameEml(emlName string) string {
 }
 
 func renameEmlFiles() {
-    // 获取当前目录
-    currentDir, err := os.Getwd()
-    if err!= nil {
-        log.Fatal(err)
-    }
+	// 获取当前目录
+	currentDir, err := os.Getwd()
+	if err != nil {
+		log.Fatal(err)
+	}
 
-    // 遍历当前目录下的所有文件
-    files, err := ioutil.ReadDir(currentDir)
-    if err!= nil {
-        log.Fatal(err)
-    }
+	// 遍历当前目录下的所有文件
+	files, err := ioutil.ReadDir(currentDir)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	var buf bytes.Buffer
-    for _, file := range files {
-        if filepath.Ext(file.Name()) == ".eml" {
+	for _, file := range files {
+		if filepath.Ext(file.Name()) == ".eml" {
 			buf.WriteString(renameEml(file.Name()))
-        }
-    }
+		}
+	}
 
 	err = os.WriteFile(XmlOfflinePATH, buf.Bytes(), os.ModePerm)
 	if err != nil {
@@ -563,5 +577,114 @@ func NewEmlInfoFromMessageHeader(h msg.Header) *EmlInfo { // 从header创建EmlI
 	iFrom, _    := h.Text("from")
 	iTo, _      := h.Text("to")
 	return &EmlInfo{Date: iDate, Subject: iSubject, From: iFrom, To: iTo}
+}
+
+func emlAttachPos(emlPath string) {
+	fEML, err := os.Open(emlPath) // 读取eml
+	if err != nil {
+		fmt.Println("# Error: 打开文件错误:", err)
+		return
+	}
+	defer fEML.Close()
+
+	scanner := bufio.NewScanner(fEML)
+	lineNumber := 0
+	nowAttachLine := ""
+	nFileName := 0
+	bAttachStart := false
+	bAttachEnd   := true
+	attachCount := 0
+	attachStartNum := 0
+	attachEndNum   := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := scanner.Text()
+		if nFileName > 0 {
+			if strings.Contains(line, "filename") {
+				nowAttachLine = line
+				nFileName = 0
+			} else {
+				nFileName++
+			}
+
+			if nFileName > 3 {
+				nFileName = 0
+			}
+		}
+		if strings.HasPrefix(line, "--") {
+			if bAttachStart {
+				attachEndNum = lineNumber - 1
+				bAttachStart = false
+				bAttachEnd = true
+				// 预估大小 = 每行76字符 * 0.75 = 57 字节
+				fmt.Println("- 附件:", attachCount, "起止行号:", attachStartNum, "-", attachEndNum, "预估大小:", 57 * ( attachEndNum - attachStartNum ), "附件名:", getAttachFileName(nowAttachLine))
+			}
+//			fmt.Println("- 分段行号:", lineNumber, line)
+			continue
+		}
+		if strings.Contains(line, "attachment") { // Content-Disposition: attachment; filename="=?UTF-8?B?MjAyNDA3MjbkGRm?="
+			attachCount++
+			if strings.Contains(line, "filename") {
+				nowAttachLine = line
+			} else {
+				nFileName = 1
+			}
+			bAttachStart = true
+			bAttachEnd = false
+//			fmt.Println("- 附件行号:", lineNumber, line)
+			continue
+		}
+		if len(line) == 0 {
+			if bAttachStart && ! bAttachEnd{
+				attachStartNum = 1 + lineNumber
+				bAttachEnd = true
+			}
+//			fmt.Println("- 空行行号:", lineNumber)
+			continue
+		}
+	}
+
+	if err := scanner.Err(); err!= nil {
+		fmt.Println("# Error: 扫描文件时出错:", err)
+	}
+}
+
+func charsetReader(charset string, input io.Reader) (io.Reader, error) {
+	charset = strings.ToLower(charset)
+	if charset == "utf-8" || charset == "iso-8859-1" || charset == "us-ascii" {
+		return input, nil
+	}
+	if msg.CharsetReader != nil {
+		r, err := msg.CharsetReader(charset, input)
+		if err != nil {
+			return r, err
+		}
+		return r, nil
+	}
+	return input, fmt.Errorf("Error: 未知编码: %q", charset)
+}
+
+func decodeEncodedWord(s string) string {
+	dec := new(mime.WordDecoder)
+	dec.CharsetReader = charsetReader
+	header, err := dec.DecodeHeader(s)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return s
+	}
+	return header
+}
+
+func getAttachFileName(attachLine string) string { // Content-Disposition: attachment; filename="=?UTF-8?B?aaaabbbbb?="
+	if ! strings.Contains(attachLine, "filename") {
+		return attachLine
+	}
+	re := regexp.MustCompile(`.*filename=[" ']?([^'"]*)[" ']?.*`)
+	matches := re.FindStringSubmatch(attachLine)
+	if len(matches) > 1 {
+		return decodeEncodedWord(matches[1])
+//		return matches[1]
+	}
+	return attachLine
 }
 
