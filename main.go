@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"mime"
 	"net/mail"
 	"os"
@@ -25,7 +26,7 @@ import (
 )
 
 var (
-	VerStr  string = "2024-08-08.15"
+	VerStr  string = "2025-04-22.10"
 	XmlOnlinePATH  string = "00_eml_online.xml"
 	XmlOfflinePATH string = "00_eml_offline.xml"
 )
@@ -185,7 +186,7 @@ func main() { // 下载邮件
 	fmt.Printf("# %s @ %s:%d  isTLS:%t\n", aUP[0], aEml[0], nPort, bTLS)
 
 	count, size, _ := c.Stat()
-	fmt.Println("# total messages =", count, ", size =", size)
+	fmt.Println("# messages count =", count, ", size =", size, "=", formatFileSize(size))
 
 	if "downOne" == NowMode { // downIDX
 		if downIDX > count {
@@ -278,13 +279,19 @@ func main() { // 下载邮件
 
 func niceFileName(iStr string) string {
 	iStr = strings.Replace(iStr, "*", "※", -1)
-	iStr = strings.Replace(iStr, "\\", "﹨", -1)
 	iStr = strings.Replace(iStr, "|", "｜", -1)
 	iStr = strings.Replace(iStr, ":", "︰", -1)
 	iStr = strings.Replace(iStr, "\"", "¨", -1)
+	iStr = strings.Replace(iStr, "[", "【", -1)
+	iStr = strings.Replace(iStr, "]", "】", -1)
+	iStr = strings.Replace(iStr, "(", "（", -1)
+	iStr = strings.Replace(iStr, ")", "）", -1)
 	iStr = strings.Replace(iStr, "<", "〈", -1)
 	iStr = strings.Replace(iStr, ">", "〉", -1)
+	iStr = strings.Replace(iStr, "\\", "﹨", -1)
 	iStr = strings.Replace(iStr, "/", "／", -1)
+	iStr = strings.Replace(iStr, ",", "，", -1)
+//	iStr = strings.Replace(iStr, "+", "+", -1)
 	iStr = strings.Replace(iStr, "?", "？", -1)
 	return iStr
 }
@@ -452,6 +459,17 @@ func saveEml(buf *bytes.Buffer, emlPath string) int64 {
 		log.Fatal(err)
 	}
 	return writeLen
+}
+
+func formatFileSize(iSize int) string {
+	units := []string{"B", "K", "M", "G", "T", "P", "E", "Z", "Y"}
+	if iSize == 0 {
+		return "0B"
+	}
+	exp := int(math.Log(float64(iSize)) / math.Log(1024))
+	size := float64(iSize) / math.Pow(1024, float64(exp))
+	unit := units[exp]
+	return fmt.Sprintf("%.2f%s", size, unit)
 }
 
 func getFileSize(fileName string) int64 {
